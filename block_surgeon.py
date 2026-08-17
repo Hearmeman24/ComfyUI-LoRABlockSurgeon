@@ -37,7 +37,8 @@ _BLOCK_RE = re.compile(r"blocks?[._](\d+)[._]")
 
 # Every up/down naming convention ComfyUI's LoRAAdapter.load recognises
 # (comfy/weight_adapter/lora.py:159-188), as (up_suffix, down_suffix).
-# AI-Toolkit-trained files use the `lora_B`/`lora_A` pair.
+# AI-Toolkit-trained LoRA files use the `lora_B`/`lora_A` pair and carry NO alpha
+# tensor (scale 1.0). Its LoKr checkpoints DO carry alpha. Handle both.
 _LORA_PAIRS = (
     (".lora_up.weight", ".lora_down.weight"),
     ("_lora.up.weight", "_lora.down.weight"),

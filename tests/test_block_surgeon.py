@@ -115,8 +115,9 @@ class TestLoRANorm(RelClose):
         self.assertRelClose(B.layer_stats(sd)[0][0].norm, expected)
 
     def test_no_alpha_means_scale_one(self):
-        """Verified: AI-Toolkit files carry no alpha tensor, so this is the
-        path that actually runs on his LoRAs."""
+        """Both paths are real: the Krea2/LTX/WAN LoRA files carry no alpha tensor
+        (scale 1.0, this test), while the MiniMax-H3 LoKr checkpoints DO -- e.g.
+        diffusion_model.blocks.0.attn.out_proj.alpha. Do not assume either way."""
         sd = {}
         delta = _lora_layer(sd, "diffusion_model.blocks.1.attn.wq", 128, 64, 16, seed=4)
         self.assertRelClose(B.layer_stats(sd)[0][0].norm, float(torch.linalg.norm(delta)))
