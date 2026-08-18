@@ -49,8 +49,8 @@ modes.
 ## Tests
 
 ```bash
-python -m pytest tests/ -q      # 36 tests, no network, no GPU, no ComfyUI import
+python -m pytest tests/ -q      # 39 tests, no network, no GPU, no ComfyUI import
 ```
 
-The load-bearing ones check the fast norms against explicitly materialised
+39 tests. The load-bearing ones check the fast norms against explicitly materialised
 products. If those drift, every number printed here is wrong.

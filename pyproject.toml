@@ -1,0 +1,14 @@
+[project]
+name = "lora-block-surgeon"
+version = "1.0.0"
+description = "Measure where a LoRA stores its learned change, per transformer block, then apply only the blocks you choose. Read-only: your .safetensors is never rewritten."
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+
+[project.urls]
+Repository = "https://github.com/Hearmeman24/ComfyUI-LoRABlockSurgeon"
+
+[tool.comfy]
+PublisherId = "hearmeman24"
+DisplayName = "LoRA Block Surgeon"
+Repository = "https://github.com/Hearmeman24/ComfyUI-LoRABlockSurgeon"
