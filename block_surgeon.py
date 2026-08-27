@@ -25,8 +25,15 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from itertools import pairwise
 
 import torch
+
+# Token-refiner paths also contain `blocks.N`, so this MUST be checked before the
+# generic main-block expression below. Both dot- and underscore-separated paths
+# occur in converted checkpoints.
+_TOKEN_REFINER_BLOCK_RE = re.compile(
+    r"(?:^|[._])token[._]refiner[._]blocks?[._](\d+)(?=[._]|$)")
 
 # Matches `blocks.31.`, `transformer_blocks.31.`, `single_blocks.31.`,
 # `double_blocks.31.` and the `_31_` variants Kohya-converted files use.
@@ -34,6 +41,9 @@ import torch
 # (28 blocks), WAN2.2 `diffusion_model.blocks.N` (40), LTX2.3
 # `diffusion_model.transformer_blocks.N` (48).
 _BLOCK_RE = re.compile(r"blocks?[._](\d+)[._]")
+
+_ATTENTION_TOKEN_RE = re.compile(r"^(?:attn|attention)\d*$")
+_MLP_TOKENS = frozenset({"mlp", "ff", "ffn", "feedforward"})
 
 # Every up/down naming convention ComfyUI's LoRAAdapter.load recognises
 # (comfy/weight_adapter/lora.py:159-188), as (up_suffix, down_suffix).
@@ -68,28 +78,84 @@ class LayerStat:
     norm: float
 
 
+@dataclass(frozen=True)
+class TensorLocation:
+    """Where a tensor lives and which optional module group controls it.
+
+    `namespace` is `main`, `token_refiner`, or `unblocked`. `group` is
+    `attention`, `mlp`, or `unknown`; unknown groups deliberately remain enabled.
+    """
+
+    namespace: str
+    block: int | None
+    group: str
+
+    @property
+    def label(self) -> str:
+        if self.namespace == "unblocked":
+            return "unblocked"
+        if self.namespace == "main":
+            return str(self.block)
+        return f"{self.namespace}.{self.block}"
+
+
 @dataclass
 class BlockStat:
-    """`block` is None for the tensors that belong to no numbered block."""
+    """A namespace-qualified profiler group."""
 
     block: int | None
     norm: float
     layers: int
     kinds: set[str] = field(default_factory=set)
+    namespace: str = "main"
 
     @property
     def label(self) -> str:
-        return "unblocked" if self.block is None else str(self.block)
+        if self.block is None:
+            return "unblocked"
+        return TensorLocation(self.namespace, self.block, "unknown").label
+
+
+def _module_group(key: str) -> str:
+    """Classify common attention/feed-forward path tokens, or return `unknown`.
+
+    Matching is intentionally conservative. A false negative leaves a tensor
+    enabled; a false positive could remove a tensor the operator never selected.
+    """
+    tokens = [token for token in re.split(r"[._]", key.lower()) if token]
+    if any(_ATTENTION_TOKEN_RE.fullmatch(token) for token in tokens):
+        return "attention"
+    if any(token in _MLP_TOKENS for token in tokens):
+        return "mlp"
+    if any(a == "feed" and b == "forward" for a, b in pairwise(tokens)):
+        return "mlp"
+    return "unknown"
+
+
+def tensor_location(key: str) -> TensorLocation:
+    """Return a namespace-aware location for a tensor key.
+
+    Token-refiner matching precedes the generic `blocks.N` matcher so its block
+    indices never collide with main transformer blocks.
+    """
+    group = _module_group(key)
+    token_refiner = _TOKEN_REFINER_BLOCK_RE.search(key)
+    if token_refiner:
+        return TensorLocation("token_refiner", int(token_refiner.group(1)), group)
+    main = _BLOCK_RE.search(key)
+    if main:
+        return TensorLocation("main", int(main.group(1)), group)
+    return TensorLocation("unblocked", None, group)
 
 
 def block_index(key: str) -> int | None:
-    """The numbered transformer block a tensor key belongs to, or None."""
-    m = _BLOCK_RE.search(key)
-    return int(m.group(1)) if m else None
+    """The numbered MAIN transformer block a tensor key belongs to, or None."""
+    location = tensor_location(key)
+    return location.block if location.namespace == "main" else None
 
 
 def blocks_present(sd: dict) -> set[int]:
-    """Every numbered block the file actually carries tensors for.
+    """Every numbered MAIN block the file actually carries tensors for.
 
     Used to catch a spec naming blocks this LoRA does not have -- a typo, or a spec
     copied from a different base model. Ignoring that silently is how you render
@@ -233,42 +299,110 @@ def block_stats(sd: dict) -> tuple[list[BlockStat], list[str]]:
     adapted layers in them.
     """
     layers, skipped = layer_stats(sd)
-    acc: dict[int | None, BlockStat] = {}
+    acc: dict[tuple[str, int | None], BlockStat] = {}
     for st in layers:
-        b = block_index(st.prefix)
-        cur = acc.get(b)
+        location = tensor_location(st.prefix)
+        key = (location.namespace, location.block)
+        cur = acc.get(key)
         if cur is None:
-            cur = acc[b] = BlockStat(block=b, norm=0.0, layers=0)
+            cur = acc[key] = BlockStat(
+                block=location.block, norm=0.0, layers=0, namespace=location.namespace)
         cur.norm = float((cur.norm ** 2 + st.norm ** 2) ** 0.5)
         cur.layers += 1
         cur.kinds.add(st.kind)
-    ordered = sorted(acc.values(), key=lambda s: (s.block is None, s.block if s.block is not None else 0))
+    namespace_order = {"main": 0, "token_refiner": 1, "unblocked": 2}
+    ordered = sorted(
+        acc.values(),
+        key=lambda s: (
+            namespace_order.get(s.namespace, 1),
+            s.block if s.block is not None else 0,
+            s.namespace,
+        ),
+    )
     return ordered, skipped
 
 
-def filter_state_dict(sd: dict, selected: set[int], mode: str = "keep") -> tuple[dict, dict]:
+_REPORT_GROUPS = (
+    "main_attention",
+    "main_mlp",
+    "main_unknown",
+    "token_refiner_attention",
+    "token_refiner_mlp",
+    "token_refiner_unknown",
+    "unblocked",
+)
+
+
+def _report_group(location: TensorLocation) -> str:
+    if location.namespace == "unblocked":
+        return "unblocked"
+    return f"{location.namespace}_{location.group}"
+
+
+def filter_state_dict(
+    sd: dict,
+    selected: set[int],
+    mode: str = "keep",
+    *,
+    include_main_attention: bool = True,
+    include_main_mlp: bool = True,
+    include_token_refiner_attention: bool = True,
+    include_token_refiner_mlp: bool = True,
+) -> tuple[dict, dict]:
     """A new dict holding only the tensors we want applied. `sd` is not mutated.
 
-    `mode="keep"` retains the selected blocks, `mode="drop"` removes them.
-    Tensors belonging to NO numbered block are always retained -- they are
-    embedders and heads, not blocks, and dropping them silently would change the
-    adapter in a way the block spec never asked for.
+    `mode="keep"` retains selected MAIN blocks, `mode="drop"` removes them.
+    Token-refiner tensors bypass numeric block selection and use their own group
+    toggles. Unknown groups and unblocked tensors are always retained by group
+    filtering; unknown main groups still obey main block selection.
     """
     if mode not in ("keep", "drop"):
         raise ValueError(f"mode must be 'keep' or 'drop', got {mode!r}")
-    out, report = {}, {"kept_blocks": set(), "dropped_blocks": set(), "unblocked_tensors": 0}
+
+    present = blocks_present(sd)
+    if mode == "keep":
+        selected_main = present & selected
+        excluded_main = present - selected
+    else:
+        selected_main = present - selected
+        excluded_main = present & selected
+
+    group_enabled = {
+        "main_attention": include_main_attention,
+        "main_mlp": include_main_mlp,
+        "token_refiner_attention": include_token_refiner_attention,
+        "token_refiner_mlp": include_token_refiner_mlp,
+    }
+    group_tensors = {group: {"kept": 0, "dropped": 0} for group in _REPORT_GROUPS}
+    report = {
+        "selected_main_blocks": selected_main,
+        "excluded_main_blocks": excluded_main,
+        # Backwards-compatible aliases. These describe numeric block selection,
+        # not whether every tensor group inside the block remained enabled.
+        "kept_blocks": selected_main,
+        "dropped_blocks": excluded_main,
+        "group_tensors": group_tensors,
+        "unblocked_tensors": 0,
+    }
+    out = {}
     for key, tensor in sd.items():
-        b = block_index(key)
-        if b is None:
-            out[key] = tensor
+        location = tensor_location(key)
+        report_group = _report_group(location)
+
+        if location.namespace == "main":
+            wanted = location.block in selected_main
+            wanted = wanted and group_enabled.get(report_group, True)
+        elif location.namespace == "token_refiner":
+            wanted = group_enabled.get(report_group, True)
+        else:
+            wanted = True
             report["unblocked_tensors"] += 1
-            continue
-        wanted = (b in selected) if mode == "keep" else (b not in selected)
+
         if wanted:
             out[key] = tensor
-            report["kept_blocks"].add(b)
+            group_tensors[report_group]["kept"] += 1
         else:
-            report["dropped_blocks"].add(b)
+            group_tensors[report_group]["dropped"] += 1
     return out, report
 
 
@@ -286,33 +420,39 @@ def format_report(sd: dict, sort_by: str = "block", top: int = 0) -> str:
     if top:
         rows = rows[:top]
 
-    numbered = [s for s in stats if s.block is not None]
+    main_blocks = [s for s in stats if s.namespace == "main"]
+    label_width = max(9, *(len(s.label) for s in stats))
     lines = [
         f"{len(stats)} groups | {sum(s.layers for s in stats)} adapted layers | "
-        f"formats: {','.join(sorted({k for s in stats for k in s.kinds}))}",
-        f"blocks present: {min((s.block for s in numbered), default='-')}"
-        f"..{max((s.block for s in numbered), default='-')}",
+        + f"formats: {','.join(sorted({k for s in stats for k in s.kinds}))}",
+        f"main blocks present: {min((s.block for s in main_blocks), default='-')}"
+        + f"..{max((s.block for s in main_blocks), default='-')}",
         "",
-        f"{'block':>9} {'layers':>7} {'‖ΔW‖_F':>12} {'energy%':>9}  profile",
+        f"{'block':>{label_width}} {'layers':>7} {'‖ΔW‖_F':>12} {'energy%':>9}  profile",
     ]
     for s in rows:
-        bar = "#" * int(round(40 * s.norm / peak))
-        lines.append(f"{s.label:>9} {s.layers:>7} {s.norm:>12.5f} "
+        bar = "#" * round(40 * s.norm / peak)
+        lines.append(f"{s.label:>{label_width}} {s.layers:>7} {s.norm:>12.5f} "
                      f"{100 * s.norm ** 2 / total_sq:>8.2f}%  {bar}")
 
-    ranked = sorted(numbered, key=lambda s: -s.norm)
+    profiled_blocks = [s for s in stats if s.namespace != "unblocked"]
+    ranked = sorted(profiled_blocks, key=lambda s: -s.norm)
     if ranked:
         cum, keep = 0.0, []
         for s in ranked:
             if cum >= 0.90:
                 break
             cum += s.norm ** 2 / total_sq
-            keep.append(s.block)
-        lines += ["", f"90% of the energy sits in {len(keep)} of {len(numbered)} blocks: "
-                      f"{_compact(sorted(keep))}"]
+            keep.append(s)
+        if all(s.namespace == "main" for s in keep):
+            compact_keep = _compact(sorted(s.block for s in keep if s.block is not None))
+        else:
+            compact_keep = ",".join(s.label for s in keep)
+        lines += ["", f"90% of the energy sits in {len(keep)} of "
+                      + f"{len(profiled_blocks)} block groups: {compact_keep}"]
     if skipped:
         lines += ["", f"NOT MEASURED ({len(skipped)} layers) -- these are excluded from every "
-                      f"number above, so treat their blocks as unknown, not as zero:"]
+                      + "number above, so treat their blocks as unknown, not as zero:"]
         lines += [f"  {s}" for s in skipped[:10]]
         if len(skipped) > 10:
             lines.append(f"  ... and {len(skipped) - 10} more")

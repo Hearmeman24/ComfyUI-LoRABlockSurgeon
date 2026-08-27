@@ -62,9 +62,10 @@ class _CachedLoad:
             f"{min(blocks)}..{max(blocks)}" if blocks else "(none found)", dt)
         if not blocks:
             logger.warning(
-                "%s no numbered blocks matched in %s -- every tensor will be treated as "
-                "'unblocked' and applied unconditionally, so the filter will be a no-op. "
-                "Check the key naming with the profiler node.", _TAG, lora_name)
+                "%s no numbered MAIN blocks matched in %s -- the numeric block filter will "
+                "be a no-op. Recognized token-refiner groups can still be controlled by their "
+                "toggles; inspect the namespace-qualified profiler output before applying.",
+                _TAG, lora_name)
 
         self.loaded = (path, sd, meta)
         return sd, meta
@@ -126,11 +127,32 @@ class LoRABlockFilter(_CachedLoad):
                                              "step": 0.01}),
                 "blocks": ("STRING", {"default": "", "multiline": False,
                                       "tooltip": "e.g. 31-35  or  0-2,31,35. "
-                                                 "Empty + keep mode applies no blocks at all."}),
+                                                 "Empty + keep mode applies no main blocks."}),
                 "mode": (["keep", "drop"],
-                         {"tooltip": "keep = apply only these blocks. "
-                                     "drop = apply everything except these."}),
-            }
+                         {"tooltip": "keep = apply only these main transformer blocks. "
+                                     "drop = apply every main transformer block except these. "
+                                     "Token-refiner blocks use the optional group toggles."}),
+            },
+            "optional": {
+                "include_main_attention": (
+                    "BOOLEAN",
+                    {"default": True,
+                     "tooltip": "Apply attention tensors in selected main transformer blocks."}),
+                "include_main_mlp": (
+                    "BOOLEAN",
+                    {"default": True,
+                     "tooltip": "Apply MLP/feed-forward tensors in selected main blocks."}),
+                "include_token_refiner_attention": (
+                    "BOOLEAN",
+                    {"default": True,
+                     "tooltip": "Apply token-refiner attention tensors. Main block ranges do not "
+                                "control token-refiner blocks."}),
+                "include_token_refiner_mlp": (
+                    "BOOLEAN",
+                    {"default": True,
+                     "tooltip": "Apply token-refiner MLP tensors. Main block ranges do not control "
+                                "token-refiner blocks."}),
+            },
         }
 
     RETURN_TYPES = ("MODEL", "STRING")
@@ -138,13 +160,24 @@ class LoRABlockFilter(_CachedLoad):
     FUNCTION = "apply"
     CATEGORY = CATEGORY
     DESCRIPTION = (
-        "LoraLoaderModelOnly with a per-block filter. Tensors belonging to no numbered "
-        "block (embedders, heads) are always applied -- they are not blocks, and dropping "
-        "them would change the adapter in a way the block spec never asked for. "
-        "Nothing is written to disk."
+        "LoraLoaderModelOnly with main-block filtering plus independent main-attention, "
+        "main-MLP, token-refiner-attention, and token-refiner-MLP controls. Tensors in "
+        "unknown groups and tensors belonging to no supported block namespace are retained "
+        "by default. Nothing is written to disk."
     )
 
-    def apply(self, model, lora_name, strength_model, blocks, mode):
+    def apply(
+        self,
+        model,
+        lora_name,
+        strength_model,
+        blocks,
+        mode,
+        include_main_attention=True,
+        include_main_mlp=True,
+        include_token_refiner_attention=True,
+        include_token_refiner_mlp=True,
+    ):
         if strength_model == 0:
             logger.info("%s strength_model=0 -> %s not applied, model passed through unchanged",
                         _TAG, lora_name)
@@ -176,14 +209,46 @@ class LoRABlockFilter(_CachedLoad):
 
         if mode == "keep" and not selected:
             logger.warning(
-                "%s blocks is empty in 'keep' mode: NO numbered block will be applied, only "
-                "the unblocked tensors. Set a spec like 31-35, or switch mode to 'drop'.", _TAG)
+                "%s blocks is empty in 'keep' mode: NO main transformer block will be applied. "
+                "Token-refiner and unblocked tensors remain governed by their separate/default "
+                "rules. Set a spec like 31-35, or switch mode to 'drop'.", _TAG)
 
-        filtered, report = filter_state_dict(sd, selected, mode)
-        kept, dropped = sorted(report["kept_blocks"]), sorted(report["dropped_blocks"])
+        filtered, report = filter_state_dict(
+            sd,
+            selected,
+            mode,
+            include_main_attention=include_main_attention,
+            include_main_mlp=include_main_mlp,
+            include_token_refiner_attention=include_token_refiner_attention,
+            include_token_refiner_mlp=include_token_refiner_mlp,
+        )
+        selected_main = sorted(report["selected_main_blocks"])
+        excluded_main = sorted(report["excluded_main_blocks"])
+        group_tensors = report["group_tensors"]
+        controlled_groups = (
+            ("main attention", "main_attention", include_main_attention),
+            ("main MLP", "main_mlp", include_main_mlp),
+            ("token-refiner attention", "token_refiner_attention",
+             include_token_refiner_attention),
+            ("token-refiner MLP", "token_refiner_mlp", include_token_refiner_mlp),
+        )
+        group_lines = []
+        for label, key, enabled in controlled_groups:
+            counts = group_tensors[key]
+            group_lines.append(
+                f"  {label}: {'enabled' if enabled else 'disabled'} | "
+                f"{counts['kept']} kept, {counts['dropped']} dropped")
+        other_kept = sum(group_tensors[key]["kept"] for key in (
+            "main_unknown", "token_refiner_unknown"))
+        other_dropped = sum(group_tensors[key]["dropped"] for key in (
+            "main_unknown", "token_refiner_unknown"))
+        group_summary = "\n".join(group_lines)
         applied = (f"{lora_name} @ {strength_model} | mode={mode}\n"
-                   f"applied blocks:  {_compact(kept)}\n"
-                   f"skipped blocks:  {_compact(dropped)}\n"
+                   f"selected main blocks:  {_compact(selected_main)}\n"
+                   f"excluded main blocks:  {_compact(excluded_main)}\n"
+                   f"module-group tensors:\n{group_summary}\n"
+                   f"  other classified/unknown: {other_kept} kept, "
+                   f"{other_dropped} dropped by main-block selection\n"
                    f"always-applied unblocked tensors: {report['unblocked_tensors']}\n"
                    f"tensors passed to the patcher: {len(filtered)} of {len(sd)}")
         logger.info("%s applying\n%s", _TAG, applied)
@@ -191,8 +256,10 @@ class LoRABlockFilter(_CachedLoad):
         t0 = time.perf_counter()
         patched, _ = comfy.sd.load_lora_for_models(
             model, None, filtered, strength_model, 0, lora_metadata=meta)
-        logger.info("%s patched model in %.2fs (%d/%d tensors, %d blocks kept, %d dropped)",
-                    _TAG, time.perf_counter() - t0, len(filtered), len(sd), len(kept), len(dropped))
+        logger.info(
+            "%s patched model in %.2fs (%d/%d tensors, %d main blocks selected, %d excluded)",
+            _TAG, time.perf_counter() - t0, len(filtered), len(sd),
+            len(selected_main), len(excluded_main))
         # comfy.sd.load_lora_for_models logs "NOT LOADED <key>" for anything that did
         # not map onto the model (comfy/sd.py:129-131). With a filter in play those
         # warnings are the signal that the key naming, not the block spec, is wrong.

@@ -5,15 +5,20 @@ against an explicitly materialised product. If those drift, every number this
 tool prints is wrong and every pruning decision made from them is wrong.
 """
 
+import importlib.util
+import inspect
 import os
 import re
 import sys
+import types
 import unittest
+from typing import ClassVar
+from unittest import mock
 
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import block_surgeon as B  # noqa: E402
+import block_surgeon as B
 
 
 class RelClose(unittest.TestCase):
@@ -50,6 +55,56 @@ class TestBlockIndex(unittest.TestCase):
 
     def test_multi_digit_index_is_not_truncated(self):
         self.assertEqual(B.block_index("diffusion_model.blocks.123.attn.lora_A.weight"), 123)
+
+    def test_token_refiner_block_is_not_a_main_block(self):
+        self.assertIsNone(B.block_index(
+            "diffusion_model.token_refiner.blocks.0.attn.qkv_proj.lora_A.weight"))
+
+
+class TestTensorLocation(unittest.TestCase):
+    """Exact MiniMax H3 V9 key forms inspected from a real checkpoint header."""
+
+    def test_main_attention_location(self):
+        loc = B.tensor_location("diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight")
+        self.assertEqual((loc.namespace, loc.block, loc.group), ("main", 0, "attention"))
+
+    def test_main_mlp_location(self):
+        loc = B.tensor_location("diffusion_model.blocks.0.mlp.fc1.lora_B.weight")
+        self.assertEqual((loc.namespace, loc.block, loc.group), ("main", 0, "mlp"))
+
+    def test_token_refiner_attention_location(self):
+        loc = B.tensor_location(
+            "diffusion_model.token_refiner.blocks.0.attn.qkv_proj.lora_A.weight")
+        self.assertEqual(
+            (loc.namespace, loc.block, loc.group), ("token_refiner", 0, "attention"))
+
+    def test_token_refiner_mlp_location(self):
+        loc = B.tensor_location(
+            "diffusion_model.token_refiner.blocks.0.mlp.fc2.lora_B.weight")
+        self.assertEqual((loc.namespace, loc.block, loc.group), ("token_refiner", 0, "mlp"))
+
+    def test_token_refiner_underscore_layout_is_namespace_qualified(self):
+        loc = B.tensor_location(
+            "lora_unet_token_refiner_blocks_1_attn_qkv_proj.lora_up.weight")
+        self.assertEqual(
+            (loc.namespace, loc.block, loc.group), ("token_refiner", 1, "attention"))
+
+    def test_common_attention_and_feed_forward_tokens(self):
+        cases = {
+            "diffusion_model.transformer_blocks.4.attn1.to_k.lora_A.weight": "attention",
+            "diffusion_model.blocks.5.cross_attn.k.lora_B.weight": "attention",
+            "double_blocks.7.img_attn.qkv.lora_A.weight": "attention",
+            "diffusion_model.blocks.8.ff.net.0.lora_A.weight": "mlp",
+            "diffusion_model.blocks.9.ffn.proj.lora_A.weight": "mlp",
+            "diffusion_model.blocks.10.feed_forward.proj.lora_A.weight": "mlp",
+        }
+        for key, group in cases.items():
+            with self.subTest(key=key):
+                self.assertEqual(B.tensor_location(key).group, group)
+
+    def test_unknown_group_stays_explicitly_unknown(self):
+        loc = B.tensor_location("diffusion_model.blocks.4.conv.proj.lora_A.weight")
+        self.assertEqual((loc.namespace, loc.block, loc.group), ("main", 4, "unknown"))
 
 
 class TestParseBlockSpec(unittest.TestCase):
@@ -248,6 +303,15 @@ class TestBlockStats(RelClose):
         self.assertIsNone(stats[-1].block)
         self.assertEqual([s.block for s in stats[:-1]], [0, 5])
 
+    def test_main_and_token_refiner_block_zero_are_separate_groups(self):
+        sd = {}
+        _lora_layer(sd, "diffusion_model.blocks.0.attn.qkv_proj", 32, 16, 4, seed=14)
+        _lora_layer(
+            sd, "diffusion_model.token_refiner.blocks.0.attn.qkv_proj", 32, 16, 4, seed=15)
+        stats, skipped = B.block_stats(sd)
+        self.assertEqual(skipped, [])
+        self.assertEqual({s.label for s in stats}, {"0", "token_refiner.0"})
+
 
 class TestFilterStateDict(unittest.TestCase):
     def _sd(self):
@@ -291,6 +355,99 @@ class TestFilterStateDict(unittest.TestCase):
             B.filter_state_dict(self._sd(), {1}, "prune")
 
 
+class TestModuleGroupFilter(unittest.TestCase):
+    CONTROLLED_PREFIXES: ClassVar[dict[str, str]] = {
+        "main_attention": "diffusion_model.blocks.0.attn.qkv_proj",
+        "main_mlp": "diffusion_model.blocks.0.mlp.fc1",
+        "token_refiner_attention": "diffusion_model.token_refiner.blocks.0.attn.qkv_proj",
+        "token_refiner_mlp": "diffusion_model.token_refiner.blocks.0.mlp.fc1",
+    }
+
+    def _sd(self):
+        sd = {}
+        for seed, prefix in enumerate(self.CONTROLLED_PREFIXES.values(), start=800):
+            _lora_layer(sd, prefix, 32, 16, 4, seed=seed)
+        _lora_layer(sd, "diffusion_model.blocks.0.conv.proj", 32, 16, 4, seed=900)
+        _lora_layer(sd, "diffusion_model.final_layer.lin", 32, 16, 4, seed=901)
+        _lora_layer(
+            sd, "diffusion_model.token_refiner.blocks.0.modulation.proj", 32, 16, 4,
+            seed=902)
+        return sd
+
+    def test_each_toggle_drops_only_its_intended_group(self):
+        toggles = {
+            "main_attention": "include_main_attention",
+            "main_mlp": "include_main_mlp",
+            "token_refiner_attention": "include_token_refiner_attention",
+            "token_refiner_mlp": "include_token_refiner_mlp",
+        }
+        sd = self._sd()
+        for dropped_group, kwarg in toggles.items():
+            with self.subTest(group=dropped_group):
+                out, report = B.filter_state_dict(sd, {0}, "keep", **{kwarg: False})
+                for group, prefix in self.CONTROLLED_PREFIXES.items():
+                    keys = {k for k in sd if k.startswith(prefix + ".")}
+                    if group == dropped_group:
+                        self.assertTrue(keys.isdisjoint(out))
+                        self.assertEqual(report["group_tensors"][group]["dropped"], len(keys))
+                    else:
+                        self.assertTrue(keys.issubset(out))
+                        self.assertEqual(report["group_tensors"][group]["dropped"], 0)
+
+    def test_main_block_selection_does_not_control_token_refiner(self):
+        sd = self._sd()
+        for mode, selected in (("keep", set()), ("drop", {0})):
+            with self.subTest(mode=mode):
+                out, _ = B.filter_state_dict(sd, selected, mode)
+                token_keys = {k for k in sd if ".token_refiner." in k}
+                self.assertTrue(token_keys.issubset(out))
+
+    def test_unknown_and_unblocked_tensors_ignore_group_toggles(self):
+        sd = self._sd()
+        out, report = B.filter_state_dict(
+            sd,
+            {0},
+            "keep",
+            include_main_attention=False,
+            include_main_mlp=False,
+            include_token_refiner_attention=False,
+            include_token_refiner_mlp=False,
+        )
+        self.assertIn("diffusion_model.blocks.0.conv.proj.lora_A.weight", out)
+        self.assertIn("diffusion_model.final_layer.lin.lora_A.weight", out)
+        self.assertIn(
+            "diffusion_model.token_refiner.blocks.0.modulation.proj.lora_A.weight", out)
+        self.assertEqual(report["group_tensors"]["main_unknown"]["dropped"], 0)
+        self.assertEqual(report["group_tensors"]["token_refiner_unknown"]["dropped"], 0)
+        self.assertEqual(report["group_tensors"]["unblocked"]["dropped"], 0)
+
+    def test_main_selection_report_is_separate_from_group_counts(self):
+        _, report = B.filter_state_dict(
+            self._sd(), {0}, "keep", include_main_attention=False)
+        self.assertEqual(report["selected_main_blocks"], {0})
+        self.assertEqual(report["excluded_main_blocks"], set())
+        self.assertGreater(report["group_tensors"]["main_attention"]["dropped"], 0)
+        self.assertGreater(report["group_tensors"]["main_mlp"]["kept"], 0)
+
+    def test_default_and_explicit_all_true_are_identical_and_read_only(self):
+        sd = self._sd()
+        before = dict(sd)
+        default, default_report = B.filter_state_dict(sd, {0}, "keep")
+        explicit, explicit_report = B.filter_state_dict(
+            sd,
+            {0},
+            "keep",
+            include_main_attention=True,
+            include_main_mlp=True,
+            include_token_refiner_attention=True,
+            include_token_refiner_mlp=True,
+        )
+        self.assertEqual(set(default), set(explicit))
+        self.assertEqual(default_report, explicit_report)
+        self.assertEqual(set(sd), set(before))
+        self.assertTrue(all(sd[key] is before[key] for key in sd))
+
+
 class TestFormatReport(unittest.TestCase):
     def test_empty_dict_says_so_rather_than_printing_an_empty_table(self):
         self.assertIn("No measurable", B.format_report({}))
@@ -320,6 +477,15 @@ class TestFormatReport(unittest.TestCase):
                 if re.match(r"^\s+\d+\s+\d+\s+[\d.]+", l)]
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0].split()[0], "9")
+
+    def test_report_qualifies_token_refiner_block_zero(self):
+        sd = {}
+        _lora_layer(sd, "diffusion_model.blocks.0.mlp.fc1", 32, 16, 4, seed=402)
+        _lora_layer(
+            sd, "diffusion_model.token_refiner.blocks.0.mlp.fc1", 32, 16, 4, seed=403)
+        report = B.format_report(sd)
+        self.assertRegex(report, r"(?m)^\s+0\s+")
+        self.assertRegex(report, r"(?m)^\s*token_refiner\.0\s+")
 
 
 class TestCompact(unittest.TestCase):
@@ -354,3 +520,68 @@ class TestBlocksPresent(unittest.TestCase):
         _lora_layer(sd, "diffusion_model.blocks.5.attn.wq", 16, 8, 2, seed=700)
         self.assertEqual(B.parse_block_spec("31-35") - B.blocks_present(sd),
                          {31, 32, 33, 34, 35})
+
+    def test_token_refiner_only_indices_are_not_main_blocks(self):
+        sd = {}
+        _lora_layer(
+            sd, "diffusion_model.token_refiner.blocks.0.attn.qkv_proj", 16, 8, 2, seed=701)
+        _lora_layer(sd, "diffusion_model.token_refiner.blocks.1.mlp.fc1", 16, 8, 2, seed=702)
+        self.assertEqual(B.blocks_present(sd), set())
+
+
+class TestComfyNodeContract(unittest.TestCase):
+    """Exercise INPUT_TYPES without importing a real ComfyUI installation."""
+
+    @staticmethod
+    def _load_nodes_module():
+        package_name = "block_surgeon_node_contract"
+        package = types.ModuleType(package_name)
+        package.__path__ = []
+
+        comfy = types.ModuleType("comfy")
+        comfy.__path__ = []
+        comfy_sd = types.ModuleType("comfy.sd")
+        comfy_utils = types.ModuleType("comfy.utils")
+        comfy.sd = comfy_sd
+        comfy.utils = comfy_utils
+
+        folder_paths = types.ModuleType("folder_paths")
+        folder_paths.get_filename_list = lambda _: ["fixture.safetensors"]
+
+        module_name = f"{package_name}.nodes"
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "nodes.py"),
+        )
+        module = importlib.util.module_from_spec(spec)
+        injected = {
+            package_name: package,
+            f"{package_name}.block_surgeon": B,
+            module_name: module,
+            "comfy": comfy,
+            "comfy.sd": comfy_sd,
+            "comfy.utils": comfy_utils,
+            "folder_paths": folder_paths,
+        }
+        with mock.patch.dict(sys.modules, injected):
+            spec.loader.exec_module(module)
+        return module
+
+    def test_group_inputs_are_optional_true_and_apply_defaults_match(self):
+        node_class = self._load_nodes_module().LoRABlockFilter
+        inputs = node_class.INPUT_TYPES()
+        optional = inputs["optional"]
+        names = (
+            "include_main_attention",
+            "include_main_mlp",
+            "include_token_refiner_attention",
+            "include_token_refiner_mlp",
+        )
+        for name in names:
+            with self.subTest(name=name):
+                self.assertEqual(optional[name][0], "BOOLEAN")
+                self.assertIs(optional[name][1]["default"], True)
+                self.assertIs(inspect.signature(node_class.apply).parameters[name].default, True)
+        blocks_tooltip = inputs["required"]["blocks"][1]["tooltip"]
+        self.assertIn("no main blocks", blocks_tooltip)
+        self.assertNotIn("no blocks at all", blocks_tooltip)
